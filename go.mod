@@ -5,6 +5,7 @@ go 1.19
 require (
 	github.com/wzshiming/sni v0.0.1
 	golang.org/x/crypto v0.1.0
+	gopkg.in/yaml.v3 v3.0.1
 )
 
 require (
