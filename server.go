@@ -1,6 +1,8 @@
 package easiest
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"crypto/tls"
 	"fmt"
@@ -10,6 +12,8 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+
+	"github.com/valyala/fasthttp"
 )
 
 const (
@@ -169,68 +173,80 @@ func (s *Server) handleTLS(ctx context.Context, conn net.Conn) error {
 }
 
 func (s *Server) bind(ctx context.Context, route Route, downstream net.Conn) error {
-	upstream, err := dialTarget(route.Target)
+	upstream, host, err := dialTarget(route.Target)
+	if err != nil {
+		return err
+	}
+	defer upstream.Close()
+
+	req := fasthttp.Request{}
+	br := readerPool.Get().(*bufio.Reader)
+	br.Reset(downstream)
+	defer func() {
+		readerPool.Put(br)
+	}()
+	err = req.Read(br)
+	if err != nil {
+		return err
+	}
+	req.SetHost(host)
+	req.SetConnectionClose()
+
+	if route.HTTP.HeaderForwardedFor {
+		req.Header.Add("X-Forwarded-For", downstream.RemoteAddr().String())
+	}
+
+	if len(route.Replaces) != 0 &&
+		req.Header.ContentLength() != 0 &&
+		(bytes.HasPrefix(req.Header.ContentType(), []byte("text/")) ||
+			bytes.HasPrefix(req.Header.ContentType(), []byte("application/javascript"))) {
+		body, err := req.BodyUncompressed()
+		if err != nil {
+			return err
+		}
+
+		for _, replace := range route.Replaces {
+			body = bytes.Replace(body, []byte(replace.New), []byte(replace.Old), -1)
+		}
+
+		req.SetBodyRaw(body)
+		req.Header.Set("Content-Encoding", "")
+	}
+
+	_, err = req.WriteTo(upstream)
+	if err != nil {
+		return err
+	}
+	resp := fasthttp.Response{}
+	br.Reset(upstream)
+	err = resp.Read(br)
 	if err != nil {
 		return err
 	}
 
-	if route.HTTP.HeaderForwardedFor {
-		downstream, err = connAddHTTPHeader(downstream, []byte("x-forwarded-for"), []byte(downstream.RemoteAddr().String()))
+	if len(route.Replaces) != 0 &&
+		resp.Header.ContentLength() != 0 &&
+		(bytes.HasPrefix(resp.Header.ContentType(), []byte("text/")) ||
+			bytes.HasPrefix(resp.Header.ContentType(), []byte("application/javascript"))) {
+		body, err := resp.BodyUncompressed()
 		if err != nil {
 			return err
 		}
+
+		for _, replace := range route.Replaces {
+			body = bytes.Replace(body, []byte(replace.Old), []byte(replace.New), -1)
+		}
+
+		resp.SetBodyRaw(body)
+		resp.Header.Set("Content-Encoding", "")
 	}
 
-	if route.HTTP.AcceptEncoding != nil {
-		downstream, err = connRemoveHTTPHeader(downstream, []byte("accept-encoding"))
-		if err != nil {
-			return err
-		}
-		downstream, err = connAddHTTPHeader(downstream, []byte("Accept-Encoding"), []byte(*route.HTTP.AcceptEncoding))
-		if err != nil {
-			return err
-		}
+	resp.SetConnectionClose()
+	_, err = resp.WriteTo(downstream)
+	if err != nil {
+		return err
 	}
-
-	if len(route.Replaces) != 0 {
-		var reuse func()
-		downstream, upstream, reuse = s.replace(route, downstream, upstream)
-		if reuse != nil {
-			defer reuse()
-		}
-	}
-	return s.tunnel(ctx, downstream, upstream)
-}
-
-func (s *Server) replace(route Route, downstream, upstream net.Conn) (net.Conn, net.Conn, func()) {
-	if len(route.Replaces) == 0 {
-		return downstream, upstream, nil
-	}
-	bufs := make([]interface{}, 0, len(route.Replaces))
-	for _, replace := range route.Replaces {
-		new := []byte(replace.New)
-		old := []byte(replace.Old)
-		buf1 := bytesPool.Get().([]byte)
-		buf2 := bytesPool.Get().([]byte)
-		downstream = connReplaceReader(downstream, new, old, buf1)
-		upstream = connReplaceReader(upstream, old, new, buf2)
-		bufs = append(bufs, buf1, buf2)
-	}
-	return downstream, upstream, func() {
-		for _, buf := range bufs {
-			bytesPool.Put(buf)
-		}
-	}
-}
-
-func (s *Server) tunnel(ctx context.Context, c1, c2 io.ReadWriteCloser) error {
-	buf1 := bytesPool.Get().([]byte)
-	buf2 := bytesPool.Get().([]byte)
-	defer func() {
-		bytesPool.Put(buf1)
-		bytesPool.Put(buf2)
-	}()
-	return tunnel(ctx, c1, c2, buf1, buf2)
+	return nil
 }
 
 // readerPool is a pool of bufio.Reader.
