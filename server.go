@@ -179,12 +179,12 @@ func (s *Server) bind(ctx context.Context, route Route, downstream net.Conn) err
 	}
 	defer upstream.Close()
 
-	req := fasthttp.Request{}
+	req := fasthttp.AcquireRequest()
+	defer fasthttp.ReleaseRequest(req)
+
 	br := readerPool.Get().(*bufio.Reader)
 	br.Reset(downstream)
-	defer func() {
-		readerPool.Put(br)
-	}()
+	defer readerPool.Put(br)
 	err = req.Read(br)
 	if err != nil {
 		return err
@@ -217,7 +217,9 @@ func (s *Server) bind(ctx context.Context, route Route, downstream net.Conn) err
 	if err != nil {
 		return err
 	}
-	resp := fasthttp.Response{}
+
+	resp := fasthttp.AcquireResponse()
+	defer fasthttp.ReleaseResponse(resp)
 	br.Reset(upstream)
 	err = resp.Read(br)
 	if err != nil {
