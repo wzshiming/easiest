@@ -112,7 +112,7 @@ func (s *Server) startTLS(ctx context.Context, svc net.Listener) error {
 }
 
 func (s *Server) handleHTTP(ctx context.Context, conn net.Conn) error {
-	conn, host, err := httpHostWithConn(conn)
+	conn, host, err := connGetHTTPHost(conn)
 	if err != nil {
 		return err
 	}
@@ -175,7 +175,18 @@ func (s *Server) bind(ctx context.Context, route Route, downstream net.Conn) err
 	}
 
 	if route.HTTP.HeaderForwardedFor {
-		downstream, err = connAddHTTPHeader(downstream, []byte("X-Forwarded-For"), []byte(downstream.RemoteAddr().String()))
+		downstream, err = connAddHTTPHeader(downstream, []byte("x-forwarded-for"), []byte(downstream.RemoteAddr().String()))
+		if err != nil {
+			return err
+		}
+	}
+
+	if route.HTTP.NoEncoding {
+		downstream, err = connRemoveHTTPHeader(downstream, []byte("accept-encoding"))
+		if err != nil {
+			return err
+		}
+		downstream, err = connAddHTTPHeader(downstream, []byte("Accept-Encoding"), []byte("identity"))
 		if err != nil {
 			return err
 		}
@@ -183,7 +194,7 @@ func (s *Server) bind(ctx context.Context, route Route, downstream net.Conn) err
 
 	if len(route.Replaces) != 0 {
 		var reuse func()
-		downstream, upstream, reuse = s.repliace(route, downstream, upstream)
+		downstream, upstream, reuse = s.replace(route, downstream, upstream)
 		if reuse != nil {
 			defer reuse()
 		}
@@ -191,9 +202,9 @@ func (s *Server) bind(ctx context.Context, route Route, downstream net.Conn) err
 	return s.tunnel(ctx, downstream, upstream)
 }
 
-func (s *Server) repliace(route Route, newConn, oldConn net.Conn) (net.Conn, net.Conn, func()) {
+func (s *Server) replace(route Route, downstream, upstream net.Conn) (net.Conn, net.Conn, func()) {
 	if len(route.Replaces) == 0 {
-		return newConn, oldConn, nil
+		return downstream, upstream, nil
 	}
 	bufs := make([]interface{}, 0, len(route.Replaces))
 	for _, replace := range route.Replaces {
@@ -201,11 +212,11 @@ func (s *Server) repliace(route Route, newConn, oldConn net.Conn) (net.Conn, net
 		old := []byte(replace.Old)
 		buf1 := bytesPool.Get().([]byte)
 		buf2 := bytesPool.Get().([]byte)
-		newConn = connReplaceReader(newConn, new, old, buf1)
-		oldConn = connReplaceReader(oldConn, old, new, buf2)
+		downstream = connReplaceReader(downstream, new, old, buf1)
+		upstream = connReplaceReader(upstream, old, new, buf2)
 		bufs = append(bufs, buf1, buf2)
 	}
-	return newConn, oldConn, func() {
+	return downstream, upstream, func() {
 		for _, buf := range bufs {
 			bytesPool.Put(buf)
 		}

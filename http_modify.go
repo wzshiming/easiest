@@ -20,8 +20,25 @@ func connHTTPRedirect(conn net.Conn, url string, code int) error {
 	return err
 }
 
+func connGetHTTPHost(conn net.Conn) (net.Conn, string, error) {
+	buf := bytes.NewBuffer(nil)
+	host, err := getHTTPHeader(io.TeeReader(conn, buf), []byte("host"))
+	if err != nil {
+		return nil, "", err
+	}
+	return wrapUnreadConn(conn, buf.Bytes()), host, nil
+}
+
 func connAddHTTPHeader(conn net.Conn, key, val []byte) (net.Conn, error) {
 	header, err := addHTTPHeader(conn, key, val)
+	if err != nil {
+		return nil, err
+	}
+	return wrapUnreadConn(conn, header), nil
+}
+
+func connRemoveHTTPHeader(conn net.Conn, key []byte) (net.Conn, error) {
+	header, err := removeHTTPHeader(conn, key)
 	if err != nil {
 		return nil, err
 	}
@@ -59,14 +76,49 @@ func addHTTPHeader(r io.Reader, key []byte, val []byte) ([]byte, error) {
 	}
 }
 
-// readerPool is a pool of bufio.Reader.
-var readerPool = &sync.Pool{
-	New: func() interface{} {
-		return bufio.NewReader(nil)
-	},
+func removeHTTPHeader(r io.Reader, key []byte) ([]byte, error) {
+	buf := bytes.NewBuffer(nil)
+	r = io.TeeReader(r, buf)
+	reader := readerPool.Get().(*bufio.Reader)
+	reader.Reset(r)
+	defer func() {
+		reader.Reset(nil)
+		readerPool.Put(reader)
+	}()
+
+	_, _, err := reader.ReadLine() // skip the first line
+	if err != nil {
+		return nil, err
+	}
+	for {
+		line, _, err := reader.ReadLine()
+		if err != nil {
+			return nil, err
+		}
+
+		// check for the end of the headers
+		if len(line) == 0 {
+			return buf.Bytes(), nil
+		}
+
+		// check for the key
+		if len(line) <= len(key) {
+			continue
+		}
+		if line[len(key)] != ':' {
+			continue
+		}
+		if !bytes.Equal(bytes.ToLower(line[:len(key)]), key) {
+			continue
+		}
+
+		header := buf.Bytes()
+		i := bytes.LastIndex(header, line)
+
+		return append(header[:i], header[i+2+len(line):]...), nil
+	}
 }
 
-// getHTTPHeader returns the value of the first header with the given name.
 func getHTTPHeader(r io.Reader, key []byte) (string, error) {
 	reader := readerPool.Get().(*bufio.Reader)
 	reader.Reset(r)
@@ -112,7 +164,7 @@ func getHTTPPath(r io.Reader) (string, error) {
 		readerPool.Put(reader)
 	}()
 
-	command, _, err := reader.ReadLine() // skip the first line
+	command, _, err := reader.ReadLine()
 	if err != nil {
 		return "", err
 	}
@@ -120,4 +172,11 @@ func getHTTPPath(r io.Reader) (string, error) {
 	begin := bytes.IndexByte(command, ' ')
 	end := bytes.IndexByte(command[begin+1:], ' ')
 	return string(command[begin+1 : begin+1+end]), nil
+}
+
+// readerPool is a pool of bufio.Reader.
+var readerPool = &sync.Pool{
+	New: func() interface{} {
+		return bufio.NewReader(nil)
+	},
 }
