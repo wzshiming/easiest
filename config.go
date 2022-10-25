@@ -13,9 +13,8 @@ type Config struct {
 }
 
 type HttpConfig struct {
-	ForceTLS           bool    `yaml:"forceTLS,omitempty"`
-	HeaderForwardedFor bool    `yaml:"headerForwardedFor,omitempty"`
-	AcceptEncoding     *string `yaml:"acceptEncoding,omitempty"`
+	ForceTLS           bool `yaml:"forceTLS,omitempty"`
+	HeaderForwardedFor bool `yaml:"headerForwardedFor,omitempty"`
 }
 
 type Route struct {
@@ -23,6 +22,7 @@ type Route struct {
 	Target   string     `yaml:"target,omitempty"`
 	HTTP     HttpConfig `yaml:"http,omitempty"`
 	Replaces []Replace  `yaml:"replaces,omitempty"`
+	Stream   bool       `yaml:"stream,omitempty"`
 }
 
 type Replace struct {
@@ -30,10 +30,10 @@ type Replace struct {
 	New string `yaml:"new,omitempty"`
 }
 
-func dialTarget(o string) (net.Conn, error) {
+func dialTarget(o string) (net.Conn, string, error) {
 	u, err := url.Parse(o)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	switch u.Scheme {
 	case "http":
@@ -41,15 +41,25 @@ func dialTarget(o string) (net.Conn, error) {
 		if port == "" {
 			port = "80"
 		}
-		return net.Dial("tcp", net.JoinHostPort(u.Hostname(), port))
+		host := u.Hostname()
+		conn, err := net.Dial("tcp", net.JoinHostPort(host, port))
+		if err != nil {
+			return nil, "", err
+		}
+		return conn, host, nil
 	case "https":
 		port := u.Port()
 		if port == "" {
 			port = "443"
 		}
-		return tls.Dial("tcp", net.JoinHostPort(u.Hostname(), port), &tls.Config{
+		host := u.Hostname()
+		conn, err := tls.Dial("tcp", net.JoinHostPort(host, port), &tls.Config{
 			InsecureSkipVerify: true,
 		})
+		if err != nil {
+			return nil, "", err
+		}
+		return conn, host, nil
 	}
-	return nil, fmt.Errorf("unsupported scheme %q", u.Scheme)
+	return nil, "", fmt.Errorf("unsupported scheme %q", u.Scheme)
 }

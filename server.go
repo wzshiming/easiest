@@ -1,6 +1,8 @@
 package easiest
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"crypto/tls"
 	"fmt"
@@ -10,6 +12,8 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+
+	"github.com/valyala/fasthttp"
 )
 
 const (
@@ -169,29 +173,105 @@ func (s *Server) handleTLS(ctx context.Context, conn net.Conn) error {
 }
 
 func (s *Server) bind(ctx context.Context, route Route, downstream net.Conn) error {
-	upstream, err := dialTarget(route.Target)
+	upstream, host, err := dialTarget(route.Target)
+	if err != nil {
+		return err
+	}
+	defer upstream.Close()
+
+	if route.Stream {
+		return s.stream(ctx, route, upstream, downstream)
+	}
+
+	req := fasthttp.AcquireRequest()
+	defer fasthttp.ReleaseRequest(req)
+
+	br := readerPool.Get().(*bufio.Reader)
+	br.Reset(downstream)
+	defer readerPool.Put(br)
+	err = req.Read(br)
+	if err != nil {
+		return err
+	}
+	req.SetHost(host)
+	req.SetConnectionClose()
+
+	if route.HTTP.HeaderForwardedFor {
+		req.Header.Add("X-Forwarded-For", downstream.RemoteAddr().String())
+	}
+
+	if len(route.Replaces) != 0 &&
+		req.Header.ContentLength() != 0 &&
+		(bytes.HasPrefix(req.Header.ContentType(), []byte("text/")) ||
+			bytes.HasPrefix(req.Header.ContentType(), []byte("application/javascript"))) {
+		body, err := req.BodyUncompressed()
+		if err != nil {
+			return err
+		}
+
+		for _, replace := range route.Replaces {
+			body = bytes.Replace(body, []byte(replace.New), []byte(replace.Old), -1)
+		}
+
+		referer := req.Header.Referer()
+		if len(referer) != 0 {
+			for _, replace := range route.Replaces {
+				referer = bytes.Replace(referer, []byte(replace.New), []byte(replace.Old), -1)
+			}
+			req.Header.SetRefererBytes(referer)
+		}
+
+		origin := req.Header.Peek("Origin")
+		if len(origin) != 0 {
+			for _, replace := range route.Replaces {
+				origin = bytes.Replace(origin, []byte(replace.New), []byte(replace.Old), -1)
+			}
+			req.Header.SetBytesV("Origin", origin)
+		}
+
+		req.SetBodyRaw(body)
+		req.Header.Set("Content-Encoding", "")
+	}
+
+	_, err = req.WriteTo(upstream)
 	if err != nil {
 		return err
 	}
 
-	if route.HTTP.HeaderForwardedFor {
-		downstream, err = connAddHTTPHeader(downstream, []byte("x-forwarded-for"), []byte(downstream.RemoteAddr().String()))
-		if err != nil {
-			return err
-		}
+	resp := fasthttp.AcquireResponse()
+	defer fasthttp.ReleaseResponse(resp)
+	br.Reset(upstream)
+	err = resp.Read(br)
+	if err != nil {
+		return err
 	}
 
-	if route.HTTP.AcceptEncoding != nil {
-		downstream, err = connRemoveHTTPHeader(downstream, []byte("accept-encoding"))
+	if len(route.Replaces) != 0 &&
+		resp.Header.ContentLength() != 0 &&
+		(bytes.HasPrefix(resp.Header.ContentType(), []byte("text/")) ||
+			bytes.HasPrefix(resp.Header.ContentType(), []byte("application/javascript"))) {
+		body, err := resp.BodyUncompressed()
 		if err != nil {
 			return err
 		}
-		downstream, err = connAddHTTPHeader(downstream, []byte("Accept-Encoding"), []byte(*route.HTTP.AcceptEncoding))
-		if err != nil {
-			return err
+
+		for _, replace := range route.Replaces {
+			body = bytes.Replace(body, []byte(replace.Old), []byte(replace.New), -1)
 		}
+
+		resp.SetBodyRaw(body)
+		resp.Header.Set("Content-Encoding", "")
 	}
 
+	resp.SetConnectionClose()
+	_, err = resp.WriteTo(downstream)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+func (s *Server) stream(ctx context.Context, route Route, upstream, downstream net.Conn) error {
 	if len(route.Replaces) != 0 {
 		var reuse func()
 		downstream, upstream, reuse = s.replace(route, downstream, upstream)
