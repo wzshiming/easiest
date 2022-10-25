@@ -1,6 +1,7 @@
 package easiest
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"fmt"
@@ -10,6 +11,9 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+
+	"github.com/valyala/fasthttp"
+	"github.com/valyala/fasthttp/fasthttpproxy"
 )
 
 const (
@@ -18,9 +22,11 @@ const (
 )
 
 type Server struct {
-	route     map[string]Route
-	tlsConfig *tls.Config
-	logger    Logger
+	route      map[string]Route
+	tlsConfig  *tls.Config
+	logger     Logger
+	httpServer fasthttp.Server
+	httpClient fasthttp.Client
 }
 
 type Logger interface {
@@ -32,11 +38,14 @@ func NewServer(conf Config, logger Logger) *Server {
 	for _, r := range conf.Routes {
 		route[r.Domain] = r
 	}
-	return &Server{
+	s := &Server{
 		route:     route,
 		tlsConfig: newAcme(nil, conf.TlsDir),
 		logger:    logger,
 	}
+	s.httpClient.Dial = fasthttpproxy.FasthttpProxyHTTPDialer()
+	s.httpServer.Handler = s.handler
+	return s
 }
 
 func (s *Server) Run(ctx context.Context) error {
@@ -168,30 +177,167 @@ func (s *Server) handleTLS(ctx context.Context, conn net.Conn) error {
 	return s.bind(ctx, route, tlsConn)
 }
 
+func (s *Server) dialTarget(o string) (net.Conn, string, error) {
+	u, err := url.Parse(o)
+	if err != nil {
+		return nil, "", err
+	}
+	switch u.Scheme {
+	case "http":
+		port := u.Port()
+		if port == "" {
+			port = "80"
+		}
+		host := u.Hostname()
+
+		conn, err := s.httpClient.Dial(net.JoinHostPort(host, port))
+		if err != nil {
+			return nil, "", err
+		}
+		return conn, host, nil
+	case "https":
+		port := u.Port()
+		if port == "" {
+			port = "443"
+		}
+		host := u.Hostname()
+		conn, err := s.httpClient.Dial(net.JoinHostPort(host, port))
+		if err != nil {
+			return nil, "", err
+		}
+
+		tlsConn := tls.Client(conn, &tls.Config{
+			InsecureSkipVerify: true,
+		})
+		if err != nil {
+			return nil, "", err
+		}
+		return tlsConn, host, nil
+	}
+	return nil, "", fmt.Errorf("unsupported scheme %q", u.Scheme)
+}
+
 func (s *Server) bind(ctx context.Context, route Route, downstream net.Conn) error {
-	upstream, err := dialTarget(route.Target)
+	if !route.Stream {
+		return s.httpServer.ServeConn(downstream)
+	} else {
+		upstream, _, err := s.dialTarget(route.Target)
+		if err != nil {
+			return err
+		}
+		defer upstream.Close()
+		return s.stream(ctx, route, upstream, downstream)
+	}
+}
+
+func (s *Server) handler(ctx *fasthttp.RequestCtx) {
+	err := s.handlerErr(ctx)
+	if err != nil {
+		if s.logger != nil {
+			s.logger.Println("handlerErr", err)
+		}
+	}
+}
+
+func (s *Server) handlerErr(ctx *fasthttp.RequestCtx) error {
+	req := &ctx.Request
+	resp := &ctx.Response
+	host := string(req.Host())
+
+	route, ok := s.route[host]
+	if !ok {
+		return fmt.Errorf("not route %q", host)
+	}
+	upstream, origin, err := s.dialTarget(route.Target)
+	if err != nil {
+		return err
+	}
+	defer upstream.Close()
+
+	if strings.HasPrefix(route.Target, "https://") {
+		req.URI().SetScheme("https")
+	} else {
+		req.URI().SetScheme("http")
+	}
+	req.SetHost(origin)
+	req.SetConnectionClose()
+
+	if route.HTTP.HeaderForwardedFor {
+		req.Header.Add(fasthttp.HeaderXForwardedFor, ctx.RemoteAddr().String())
+	}
+
+	if len(route.Replaces) != 0 &&
+		req.Header.ContentLength() != 0 &&
+		(bytes.HasPrefix(req.Header.ContentType(), []byte("text/")) ||
+			bytes.HasPrefix(req.Header.ContentType(), []byte("application/javascript"))) {
+		body, err := req.BodyUncompressed()
+		if err != nil {
+			return err
+		}
+
+		for _, replace := range route.Replaces {
+			body = bytes.Replace(body, []byte(replace.New), []byte(replace.Old), -1)
+		}
+
+		referer := req.Header.Referer()
+		if len(referer) != 0 {
+			for _, replace := range route.Replaces {
+				referer = bytes.Replace(referer, []byte(replace.New), []byte(replace.Old), -1)
+			}
+			req.Header.SetRefererBytes(referer)
+		}
+
+		origin := req.Header.Peek(fasthttp.HeaderOrigin)
+		if len(origin) != 0 {
+			for _, replace := range route.Replaces {
+				origin = bytes.Replace(origin, []byte(replace.New), []byte(replace.Old), -1)
+			}
+			req.Header.SetBytesV(fasthttp.HeaderOrigin, origin)
+		}
+
+		req.SetBodyRaw(body)
+		req.Header.Set(fasthttp.HeaderContentEncoding, "")
+	}
+
+	err = fasthttp.Do(req, resp)
 	if err != nil {
 		return err
 	}
 
-	if route.HTTP.HeaderForwardedFor {
-		downstream, err = connAddHTTPHeader(downstream, []byte("x-forwarded-for"), []byte(downstream.RemoteAddr().String()))
+	if len(req.Header.Referer()) != 0 {
+		resp.Header.Set(fasthttp.HeaderAccessControlAllowOrigin, "*")
+	}
+
+	resp.Header.Del(fasthttp.HeaderContentSecurityPolicy)
+	if len(route.Replaces) != 0 &&
+		resp.Header.ContentLength() != 0 &&
+		(bytes.HasPrefix(resp.Header.ContentType(), []byte("text/")) ||
+			bytes.HasPrefix(resp.Header.ContentType(), []byte("application/javascript"))) {
+		body, err := resp.BodyUncompressed()
 		if err != nil {
 			return err
+		}
+
+		for _, replace := range route.Replaces {
+			body = bytes.Replace(body, []byte(replace.Old), []byte(replace.New), -1)
+		}
+
+		resp.SetBodyRaw(body)
+		resp.Header.Set(fasthttp.HeaderContentEncoding, "")
+
+		timingAllowOrigin := resp.Header.Peek(fasthttp.HeaderTimingAllowOrigin)
+		if len(timingAllowOrigin) != 0 {
+			for _, replace := range route.Replaces {
+				timingAllowOrigin = bytes.Replace(timingAllowOrigin, []byte(replace.Old), []byte(replace.New), -1)
+			}
+			resp.Header.SetBytesV(fasthttp.HeaderTimingAllowOrigin, timingAllowOrigin)
 		}
 	}
 
-	if route.HTTP.AcceptEncoding != nil {
-		downstream, err = connRemoveHTTPHeader(downstream, []byte("accept-encoding"))
-		if err != nil {
-			return err
-		}
-		downstream, err = connAddHTTPHeader(downstream, []byte("Accept-Encoding"), []byte(*route.HTTP.AcceptEncoding))
-		if err != nil {
-			return err
-		}
-	}
+	return nil
+}
 
+func (s *Server) stream(ctx context.Context, route Route, upstream, downstream net.Conn) error {
 	if len(route.Replaces) != 0 {
 		var reuse func()
 		downstream, upstream, reuse = s.replace(route, downstream, upstream)
