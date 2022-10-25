@@ -3,41 +3,45 @@ package main
 import (
 	"context"
 	"flag"
+	"github.com/wzshiming/easiest"
+	yaml "gopkg.in/yaml.v3"
 	"log"
 	"os"
-	"strings"
-
-	"github.com/wzshiming/easiest"
 )
 
 var (
-	rule = "localhost=example.org:80"
-	dir  = ""
+	config = ""
+	dir    = ""
 )
 
 func init() {
-	flag.StringVar(&rule, "r", rule, "mapping rules")
+	flag.StringVar(&config, "c", config, "route config")
 	flag.StringVar(&dir, "d", dir, "tls dir")
 	flag.Parse()
 }
 
 func main() {
 	logger := log.New(os.Stderr, "[easiest] ", log.LstdFlags)
-	r := map[string]string{}
-	for _, o := range strings.Split(rule, ",") {
-		l := strings.SplitN(o, "=", 3)
-		if len(l) >= 2 {
-			k := strings.TrimSpace(l[0])
-			v := strings.TrimSpace(l[1])
-			r[k] = v
-			logger.Println(k, "->", v)
-		}
+
+	data, err := os.ReadFile(config)
+	if err != nil {
+		logger.Println("read config: ", err)
+		os.Exit(1)
 	}
+	var conf easiest.Config
+	err = yaml.Unmarshal(data, &conf)
+	if err != nil {
+		logger.Println("unmarshal config: ", err)
+		os.Exit(1)
+	}
+	data, _ = yaml.Marshal(conf)
+	os.Stderr.Write(data)
 
-	server := easiest.NewServer(r, "", logger)
+	server := easiest.NewServer(conf, logger)
 
-	err := server.Run(context.Background())
+	err = server.Run(context.Background())
 	if err != nil {
 		logger.Println("run", err)
+		os.Exit(1)
 	}
 }

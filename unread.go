@@ -18,14 +18,14 @@ func tlsHostWithConn(conn net.Conn) (net.Conn, string, error) {
 	return wrapUnreadConn(conn, buf.Bytes()), host, nil
 }
 
-// httpHostWithConn returns the TLS host
-func httpHostWithConn(conn net.Conn) (net.Conn, string, error) {
+// httpPathWithConn returns the path
+func httpPathWithConn(conn net.Conn) (net.Conn, string, error) {
 	buf := bytes.NewBuffer(nil)
-	host, err := sni.HTTPHost(io.TeeReader(conn, buf))
+	path, err := getHTTPPath(io.TeeReader(conn, buf))
 	if err != nil {
 		return nil, "", err
 	}
-	return wrapUnreadConn(conn, buf.Bytes()), host, nil
+	return wrapUnreadConn(conn, buf.Bytes()), path, nil
 }
 
 func wrapUnreadConn(conn net.Conn, prefix []byte) net.Conn {

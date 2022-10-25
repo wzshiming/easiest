@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 )
@@ -16,7 +18,7 @@ const (
 )
 
 type Server struct {
-	route     map[string]string
+	route     map[string]Route
 	tlsConfig *tls.Config
 	logger    Logger
 }
@@ -25,10 +27,14 @@ type Logger interface {
 	Println(v ...interface{})
 }
 
-func NewServer(route map[string]string, tlsDir string, logger Logger) *Server {
+func NewServer(conf Config, logger Logger) *Server {
+	route := map[string]Route{}
+	for _, r := range conf.Routes {
+		route[r.Domain] = r
+	}
 	return &Server{
 		route:     route,
-		tlsConfig: newAcme(nil, tlsDir),
+		tlsConfig: newAcme(nil, conf.TlsDir),
 		logger:    logger,
 	}
 }
@@ -87,33 +93,6 @@ func (s *Server) startHTTP(ctx context.Context, svc net.Listener) error {
 	}
 }
 
-func (s *Server) handleHTTP(ctx context.Context, conn net.Conn) error {
-	conn, host, err := httpHostWithConn(conn)
-	if err != nil {
-		return err
-	}
-
-	if i := strings.LastIndex(host, ":"); i > 0 {
-		host = host[:i]
-	}
-
-	target := s.route[host]
-	if target == "" {
-		return fmt.Errorf("not route %q", host)
-	}
-
-	injectedConn, err := s.injectForwardedFor(conn, conn.RemoteAddr().String())
-	if err != nil {
-		return err
-	}
-
-	remote, err := net.Dial("tcp", target)
-	if err != nil {
-		return err
-	}
-	return s.tunnel(ctx, injectedConn, remote)
-}
-
 func (s *Server) startTLS(ctx context.Context, svc net.Listener) error {
 	for {
 		conn, err := svc.Accept()
@@ -132,6 +111,39 @@ func (s *Server) startTLS(ctx context.Context, svc net.Listener) error {
 	}
 }
 
+func (s *Server) handleHTTP(ctx context.Context, conn net.Conn) error {
+	conn, host, err := connGetHTTPHost(conn)
+	if err != nil {
+		return err
+	}
+
+	if i := strings.LastIndex(host, ":"); i > 0 {
+		host = host[:i]
+	}
+
+	route, ok := s.route[host]
+	if !ok {
+		return fmt.Errorf("not route %q", host)
+	}
+
+	if !route.HTTP.ForceTLS {
+		return s.bind(ctx, route, conn)
+	}
+
+	conn, path, err := httpPathWithConn(conn)
+	if err != nil {
+		return err
+	}
+	u, err := url.Parse(path)
+	if err != nil {
+		return err
+	}
+	u.Host = host
+	u.Scheme = "https"
+	u.Fragment = ""
+	return connHTTPRedirect(conn, u.String(), http.StatusFound)
+}
+
 func (s *Server) handleTLS(ctx context.Context, conn net.Conn) error {
 	conn, host, err := tlsHostWithConn(conn)
 	if err != nil {
@@ -142,8 +154,8 @@ func (s *Server) handleTLS(ctx context.Context, conn net.Conn) error {
 		host = host[:i]
 	}
 
-	target := s.route[host]
-	if target == "" {
+	route, ok := s.route[host]
+	if !ok {
 		return fmt.Errorf("not route %q", host)
 	}
 
@@ -153,31 +165,62 @@ func (s *Server) handleTLS(ctx context.Context, conn net.Conn) error {
 		return err
 	}
 
-	injectedConn, err := s.injectForwardedFor(tlsConn, conn.RemoteAddr().String())
-	if err != nil {
-		return err
-	}
-
-	remote, err := net.Dial("tcp", target)
-	if err != nil {
-		return err
-	}
-
-	return s.tunnel(ctx, injectedConn, remote)
+	return s.bind(ctx, route, tlsConn)
 }
 
-func (s *Server) injectForwardedFor(conn net.Conn, remoteAddr string) (net.Conn, error) {
-	header, err := modifyOrAddHTTPHeader(conn, []byte("x-forwarded-for"), func(prior []byte) []byte {
-		if len(prior) > 0 {
-			return []byte(string(prior) + ", " + remoteAddr)
-		} else {
-			return []byte(remoteAddr)
-		}
-	})
+func (s *Server) bind(ctx context.Context, route Route, downstream net.Conn) error {
+	upstream, err := dialTarget(route.Target)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	return wrapUnreadConn(conn, header), nil
+
+	if route.HTTP.HeaderForwardedFor {
+		downstream, err = connAddHTTPHeader(downstream, []byte("x-forwarded-for"), []byte(downstream.RemoteAddr().String()))
+		if err != nil {
+			return err
+		}
+	}
+
+	if route.HTTP.AcceptEncoding != nil {
+		downstream, err = connRemoveHTTPHeader(downstream, []byte("accept-encoding"))
+		if err != nil {
+			return err
+		}
+		downstream, err = connAddHTTPHeader(downstream, []byte("Accept-Encoding"), []byte(*route.HTTP.AcceptEncoding))
+		if err != nil {
+			return err
+		}
+	}
+
+	if len(route.Replaces) != 0 {
+		var reuse func()
+		downstream, upstream, reuse = s.replace(route, downstream, upstream)
+		if reuse != nil {
+			defer reuse()
+		}
+	}
+	return s.tunnel(ctx, downstream, upstream)
+}
+
+func (s *Server) replace(route Route, downstream, upstream net.Conn) (net.Conn, net.Conn, func()) {
+	if len(route.Replaces) == 0 {
+		return downstream, upstream, nil
+	}
+	bufs := make([]interface{}, 0, len(route.Replaces))
+	for _, replace := range route.Replaces {
+		new := []byte(replace.New)
+		old := []byte(replace.Old)
+		buf1 := bytesPool.Get().([]byte)
+		buf2 := bytesPool.Get().([]byte)
+		downstream = connReplaceReader(downstream, new, old, buf1)
+		upstream = connReplaceReader(upstream, old, new, buf2)
+		bufs = append(bufs, buf1, buf2)
+	}
+	return downstream, upstream, func() {
+		for _, buf := range bufs {
+			bytesPool.Put(buf)
+		}
+	}
 }
 
 func (s *Server) tunnel(ctx context.Context, c1, c2 io.ReadWriteCloser) error {
