@@ -179,6 +179,10 @@ func (s *Server) bind(ctx context.Context, route Route, downstream net.Conn) err
 	}
 	defer upstream.Close()
 
+	if route.Stream {
+		return s.stream(ctx, route, upstream, downstream)
+	}
+
 	req := fasthttp.AcquireRequest()
 	defer fasthttp.ReleaseRequest(req)
 
@@ -249,6 +253,48 @@ func (s *Server) bind(ctx context.Context, route Route, downstream net.Conn) err
 		return err
 	}
 	return nil
+}
+
+func (s *Server) stream(ctx context.Context, route Route, upstream, downstream net.Conn) error {
+	if len(route.Replaces) != 0 {
+		var reuse func()
+		downstream, upstream, reuse = s.replace(route, downstream, upstream)
+		if reuse != nil {
+			defer reuse()
+		}
+	}
+	return s.tunnel(ctx, downstream, upstream)
+}
+
+func (s *Server) replace(route Route, downstream, upstream net.Conn) (net.Conn, net.Conn, func()) {
+	if len(route.Replaces) == 0 {
+		return downstream, upstream, nil
+	}
+	bufs := make([]interface{}, 0, len(route.Replaces))
+	for _, replace := range route.Replaces {
+		new := []byte(replace.New)
+		old := []byte(replace.Old)
+		buf1 := bytesPool.Get().([]byte)
+		buf2 := bytesPool.Get().([]byte)
+		downstream = connReplaceReader(downstream, new, old, buf1)
+		upstream = connReplaceReader(upstream, old, new, buf2)
+		bufs = append(bufs, buf1, buf2)
+	}
+	return downstream, upstream, func() {
+		for _, buf := range bufs {
+			bytesPool.Put(buf)
+		}
+	}
+}
+
+func (s *Server) tunnel(ctx context.Context, c1, c2 io.ReadWriteCloser) error {
+	buf1 := bytesPool.Get().([]byte)
+	buf2 := bytesPool.Get().([]byte)
+	defer func() {
+		bytesPool.Put(buf1)
+		bytesPool.Put(buf2)
+	}()
+	return tunnel(ctx, c1, c2, buf1, buf2)
 }
 
 // readerPool is a pool of bufio.Reader.

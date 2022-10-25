@@ -13,9 +13,8 @@ type Config struct {
 }
 
 type HttpConfig struct {
-	ForceTLS           bool    `yaml:"forceTLS,omitempty"`
-	HeaderForwardedFor bool    `yaml:"headerForwardedFor,omitempty"`
-	AcceptEncoding     *string `yaml:"acceptEncoding,omitempty"`
+	ForceTLS           bool `yaml:"forceTLS,omitempty"`
+	HeaderForwardedFor bool `yaml:"headerForwardedFor,omitempty"`
 }
 
 type Route struct {
@@ -23,6 +22,7 @@ type Route struct {
 	Target   string     `yaml:"target,omitempty"`
 	HTTP     HttpConfig `yaml:"http,omitempty"`
 	Replaces []Replace  `yaml:"replaces,omitempty"`
+	Stream   bool       `yaml:"stream,omitempty"`
 }
 
 type Replace struct {
