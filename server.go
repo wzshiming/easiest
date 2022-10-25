@@ -181,12 +181,12 @@ func (s *Server) bind(ctx context.Context, route Route, downstream net.Conn) err
 		}
 	}
 
-	if route.HTTP.NoEncoding {
+	if route.HTTP.AcceptEncoding != "" {
 		downstream, err = connRemoveHTTPHeader(downstream, []byte("accept-encoding"))
 		if err != nil {
 			return err
 		}
-		downstream, err = connAddHTTPHeader(downstream, []byte("Accept-Encoding"), []byte("identity"))
+		downstream, err = connAddHTTPHeader(downstream, []byte("Accept-Encoding"), []byte(route.HTTP.AcceptEncoding))
 		if err != nil {
 			return err
 		}

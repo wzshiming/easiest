@@ -13,9 +13,9 @@ type Config struct {
 }
 
 type HttpConfig struct {
-	ForceTLS           bool `yaml:"forceTLS,omitempty"`
-	HeaderForwardedFor bool `yaml:"headerForwardedFor,omitempty"`
-	NoEncoding         bool `yaml:"noEncoding,omitempty"`
+	ForceTLS           bool   `yaml:"forceTLS,omitempty"`
+	HeaderForwardedFor bool   `yaml:"headerForwardedFor,omitempty"`
+	AcceptEncoding     string `yaml:"acceptEncoding,omitempty"`
 }
 
 type Route struct {
