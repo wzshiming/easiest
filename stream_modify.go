@@ -80,6 +80,9 @@ func (r *replaceReader) replaceAll() {
 }
 
 func (r *replaceReader) replace(off int) int {
+	if len(r.buf) <= off {
+		return -1
+	}
 	i := off
 	for !bytes.HasPrefix(r.buf[i:], r.old) {
 		l := bytes.IndexByte(r.buf[i+1:], r.old[0])
@@ -97,5 +100,5 @@ func (r *replaceReader) replace(off int) int {
 		r.buf = r.buf[:len(r.buf)-len(r.old)+len(r.new)]
 	}
 
-	return i + len(r.new)
+	return i + len(r.new) + 1
 }
