@@ -1,8 +1,9 @@
 package easiest
 
 type Config struct {
-	TlsDir string  `yaml:"tlsDir,omitempty"`
-	Routes []Route `yaml:"routes,omitempty"`
+	DebugAddress string  `yaml:"debugAddress,omitempty"`
+	TlsDir       string  `yaml:"tlsDir,omitempty"`
+	Routes       []Route `yaml:"routes,omitempty"`
 }
 
 type HttpConfig struct {

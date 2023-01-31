@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	_ "net/http/pprof"
 	"net/url"
 	"strings"
 	"sync"
@@ -22,11 +23,12 @@ const (
 )
 
 type Server struct {
-	route      map[string]Route
-	tlsConfig  *tls.Config
-	logger     Logger
-	httpServer fasthttp.Server
-	httpClient fasthttp.Client
+	route        map[string]Route
+	debugAddress string
+	tlsConfig    *tls.Config
+	logger       Logger
+	httpServer   fasthttp.Server
+	httpClient   fasthttp.Client
 }
 
 type Logger interface {
@@ -39,9 +41,10 @@ func NewServer(conf Config, logger Logger) *Server {
 		route[r.Domain] = r
 	}
 	s := &Server{
-		route:     route,
-		tlsConfig: newAcme(nil, conf.TlsDir),
-		logger:    logger,
+		route:        route,
+		debugAddress: conf.DebugAddress,
+		tlsConfig:    newAcme(nil, conf.TlsDir),
+		logger:       logger,
 	}
 	s.httpClient.Dial = fasthttpproxy.FasthttpProxyHTTPDialer()
 	s.httpServer.Handler = s.handler
@@ -59,7 +62,7 @@ func (s *Server) Run(ctx context.Context) error {
 	}
 
 	wg := sync.WaitGroup{}
-	wg.Add(2)
+	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		err := s.startHTTP(ctx, httpServer)
@@ -70,6 +73,7 @@ func (s *Server) Run(ctx context.Context) error {
 		}
 	}()
 
+	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		err := s.startTLS(ctx, httpsServer)
@@ -79,6 +83,19 @@ func (s *Server) Run(ctx context.Context) error {
 			}
 		}
 	}()
+
+	if s.debugAddress != "" {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			err := http.ListenAndServe(s.debugAddress, http.DefaultServeMux)
+			if err != nil {
+				if s.logger != nil {
+					s.logger.Println("ListenAndServe debug", err)
+				}
+			}
+		}()
+	}
 
 	wg.Wait()
 	return nil
